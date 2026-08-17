@@ -2,7 +2,7 @@ import requests
 import time
 import xml.etree.ElementTree as ET
 
-SEC_HEADERS = {"User-Agent": "ResearchAgent yourname@domain.com"} # Gecerli bir eposta girin
+SEC_HEADERS = {"User-Agent": "ResearchAgent 0527em@gmail.com"} # Gecerli bir eposta girin
 
 def check_insider_buys(ticker, cik):
     """SEC'den son Form 4 filings ceker ve sadece 'P' (Purchase) olanlari sayar."""
