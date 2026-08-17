@@ -7,36 +7,29 @@ st.set_page_config(page_title="US Quant Radar", layout="wide")
 st.title("🇺🇸 US Quant Radar (S&P500 & Nasdaq-100)")
 st.caption("RVOL, Fiyat İvmesi, Short Squeeze ve Insider Alım Analizi")
 
-# 1. Ana Sonuclar Tablosu
 if os.path.exists("sonuclar.csv"):
     df = pd.read_csv("sonuclar.csv")
-    
     st.metric("Taranan Toplam Hisse", len(df))
-    
     st.subheader("🚀 En Yüksek Quant Skorlu Hisseler")
     
-    # Sütunları düzenle
-    cols = ['ticker', 'quant_score', 'rvol_ratio', 'change_%', 'yapisal_skor', 'insider_bonus']
-    disp_df = df[cols].copy()
-    disp_df.columns = ['Hisse', 'Quant Skor', 'RVOL', 'Günlük %', 'Yapısal Skor', 'Insider']
+    kolonlar = ['ticker', 'quant_score', 'rvol_ratio', 'change_%', 'yapisal_skor', 'insider_bonus']
+    # Sadece mevcut olan kolonları seç (Hata almamak için)
+    mevcut_kolonlar = [k for k in kolonlar if k in df.columns]
+    disp_df = df[mevcut_kolonlar].copy()
     
-    # Skor bazlı renklendirme
+    # Başlıkları Türkçeleştir
+    mapping = {
+        'ticker': 'Hisse', 'quant_score': 'Quant Skor', 'rvol_ratio': 'RVOL',
+        'change_%': 'Günlük %', 'yapisal_skor': 'Yapısal Skor', 'insider_bonus': 'Insider'
+    }
+    disp_df = disp_df.rename(columns=mapping)
+
+    # Tabloyu renklendir (Matplotlib hatasını bu blok çözer)
     st.dataframe(
         disp_df.style.format(precision=2).background_gradient(subset=['Quant Skor'], cmap='RdYlGn'),
         use_container_width=True
     )
     
-    st.info("💡 RVOL > 1.5 ve Yapısal Skor > 70 olan hisseler squeeze (sıkıştırma) potansiyeli taşır.")
+    st.info("💡 RVOL > 1.5 ve Yapısal Skor > 70 olan hisseler squeeze potansiyeli taşır.")
 else:
-    st.warning("Henüz tarama verisi oluşmadı. GitHub Actions ilk çalışmayı bitirdiğinde burada görünecek.")
-
-# 2. Yapısal Kapi Detayları (Ayrı bir sekme veya expander)
-if os.path.exists("yapisal_gate.csv"):
-    with st.expander("🔍 Yapısal Kapı Detayları (Short Interest & Days-to-Cover)"):
-        df_y = pd.read_csv("yapisal_gate.csv")
-        st.write("Bu tablo 2 haftada bir güncellenen FINRA verilerini içerir.")
-        st.dataframe(df_y, use_container_width=True)
-
-st.sidebar.markdown("### Sistem Notları")
-st.sidebar.write("- Veriler ABD kapanışından sonra (TSİ 23:30) güncellenir.")
-st.sidebar.write("- Insider verisi SEC EDGAR üzerinden çekilir.")
+    st.warning("Veri bulunamadı. GitHub Actions işleminin bitmesini bekleyin.")
