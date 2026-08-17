@@ -1,0 +1,27 @@
+name: US Quant Radar Daily
+on:
+  schedule:
+    - cron: '30 21 * * 1-5' # 16:30 ET (Kapanistan hemen sonra)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Run
+        run: python main_daily.py
+      - name: Push
+        run: |
+          git config --global user.name "QuantBot-US"
+          git config --global user.email "bot@github.com"
+          git add sonuclar.csv gecmis_veri.csv
+          git commit -m "US Data Update: $(date)" || echo "No changes"
+          git push
