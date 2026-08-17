@@ -10,14 +10,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+
       - name: Install
         run: pip install -r requirements.txt
+
       - name: Run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python main_daily.py
+
       - name: Push
         run: |
           git config --global user.name "QuantBot-US"
