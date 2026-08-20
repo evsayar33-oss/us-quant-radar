@@ -4,68 +4,65 @@ import yfinance as yf
 
 GECMIS_DOSYA = "gecmis_veri.csv"
 
-def get_option_sentiment(ticker):
-    """Hisse bazlı Put/Call hacim verisini çeker."""
-    try:
-        t = yf.Ticker(ticker)
-        options = t.options
-        if not options: return 0.7 
-        opt_chain = t.option_chain(options[0])
-        puts_vol = opt_chain.puts['volume'].sum()
-        calls_vol = opt_chain.calls['volume'].sum()
-        if calls_vol == 0: return 1.5
-        return puts_vol / calls_vol
-    except:
-        return 0.7
-
 def gunluk_veri_cek(tickers):
-    data = yf.download(tickers, period="2d", interval="1d", progress=False)['Close']
+    # Toplu veri cekimi
+    data = yf.download(tickers, period="5d", interval="1d", progress=False)
+    closes = data['Close'].ffill()
+    volumes = data['Volume'].ffill()
+    
     df_bugun = []
     for t in tickers:
         try:
-            if t in data.columns:
-                ticker_data = data[t].dropna()
-                if len(ticker_data) >= 2:
-                    bugun, dun = ticker_data.iloc[-1], ticker_data.iloc[-2]
-                    vol = yf.Ticker(t).fast_info.get('last_volume', 0)
-                    df_bugun.append({"ticker": t, "close": float(bugun), "volume": float(vol), "change_%": (bugun/dun-1)*100})
+            if t in closes.columns:
+                p_series = closes[t].dropna()
+                v_series = volumes[t].dropna()
+                if len(p_series) >= 2:
+                    df_bugun.append({
+                        "ticker": t,
+                        "close": p_series.iloc[-1],
+                        "volume": v_series.iloc[-1],
+                        "change_%": (p_series.iloc[-1]/p_series.iloc[-2]-1)*100
+                    })
         except: continue
     return pd.DataFrame(df_bugun)
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, option_data_map):
     if df.empty: return df
 
-    # 1. RVOL & Fiyat Dilimleri
-    rvol_list = []
+    # 1. HACIM Z-SCORE (RVOL)
+    z_vol_list = []
     for _, row in df.iterrows():
-        gecmis = df_gecmis[df_gecmis['ticker'] == row['ticker']]['volume'].tail(20) if not df_gecmis.empty else []
-        rvol_list.append(row['volume'] / gecmis.mean() if len(gecmis) >= 5 else 1.0)
-    df['rvol_ratio'] = rvol_list
+        hist_v = df_gecmis[df_gecmis['ticker'] == row['ticker']]['volume'].tail(20)
+        if len(hist_v) >= 5:
+            # Z-Score: (Bugun - Ortalama) / StdDev
+            z = (row['volume'] - hist_v.mean()) / (hist_v.std() + 1e-9)
+            z_vol_list.append(np.clip(z, -3, 3)) # Sinyali 3 sigma ile sınırla
+        else:
+            z_vol_list.append(0)
+    df['vol_z'] = z_vol_list
     
-    df['pct_rvol'] = df['rvol_ratio'].rank(pct=True) * 100
-    df['pct_change'] = df['change_%'].rank(pct=True) * 100
+    # 2. FIYAT DEGISIM Z-SCORE
+    df['pct_change_rank'] = df['change_%'].rank(pct=True) * 100
     
-    # 2. Yapısal & Insider
-    df = df.merge(df_yapisal[['ticker', 'yapisal_skor']], on='ticker', how='left')
-    df['yapisal_skor'] = df['yapisal_skor'].fillna(50.0)
+    # 3. Yapisal Verileri Birlestir
+    df = df.merge(df_yapisal[['ticker', 'squeeze_skor', 'is_micro']], on='ticker', how='left')
+    df['squeeze_skor'] = df['squeeze_skor'].fillna(50.0)
+    
+    # 4. Opsiyon ve Insider Bonus
+    df['option_rank'] = df['ticker'].map(option_data_map).fillna(50.0)
     df['insider_bonus'] = df['ticker'].map(insider_bonus_map).fillna(0)
     
-    # 3. DİNAMİK OPSİYON ANALİZİ (ADAPTİF EŞİK)
-    df['pc_ratio'] = df['ticker'].map(option_data_map).fillna(0.7)
-    # Put/Call rasyosu ne kadar düşükse, puan o kadar yüksek olmalı (Ters rank)
-    df['pct_pc_rank'] = (1 - df['pc_ratio'].rank(pct=True)) * 100
-    
-    # 4. FINAL FORMÜL (Tümü adaptif yüzdelik dilimlerden oluşur)
-    # Artık 0.5/0.7 gibi rakamlar yok, sadece "piyasadaki diğerlerine göre durumu" var.
+    # --- FINAL QUANT SCORE (Z-SCORE TABANLI) ---
+    # Agirliklar: %30 Hacim Z + %20 Fiyat Rank + %30 Squeeze Skoru + %20 Opsiyon
     df['quant_score'] = (
-        (df['pct_rvol'] * 0.30) + 
-        (df['pct_change'] * 0.20) + 
-        (df['yapisal_skor'] * 0.25) + 
-        (df['pct_pc_rank'] * 0.15) + 
+        (df['vol_z'] * 10 + 50) * 0.30 + # Z-Skoru 0-100 arasina cekiyoruz
+        (df['pct_change_rank'] * 0.20) +
+        (df['squeeze_skor'] * 0.30) +
+        (df['option_rank'] * 0.20) +
         df['insider_bonus']
     )
-
-    # 5. Fark Hesabı
+    
+    # 5. Skor Değişimi (Çıkış Sinyali için)
     df['score_diff'] = 0.0
     if not df_gecmis.empty and 'quant_score' in df_gecmis.columns:
         df_son = df_gecmis[df_gecmis['tarih'] == df_gecmis['tarih'].max()]
