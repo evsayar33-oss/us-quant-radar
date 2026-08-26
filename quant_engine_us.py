@@ -8,15 +8,15 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    Hisselerin fiyat, hacim ve orta vadeli yapısal trendini çeker.
-    Düşüş trendindeki 'düşen bıçak' hisseleri tespit edip eler.
+    3 Aylık (60 Günlük) makro trendi çeker.
+    Genel grafiği düşüş trendinde olan (CAN, BEAM vb.) hisseleri tespit edip eler.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 1 aylık ham veriyi tek seferde çek
-        data = yf.download(tickers, period="1mo", interval="1d", progress=False, group_by='column')
+        # 3 aylık veriyi tek toplu istekte çekiyoruz (Orta vadeli gerçek trendi görmek için)
+        data = yf.download(tickers, period="3mo", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
 
@@ -44,41 +44,41 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 10 and len(v_series) >= 10:
+                if len(p_series) >= 20 and len(v_series) >= 20:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. Taban Hacim ve RVOL (Bugünkü Hacim / 20 Günlük Ortalama)
-                    hist_vol = v_series.iloc[:-1].tail(20) if len(v_series) > 5 else v_series
+                    # 1. 20 Günlük Hacim Ortalaması ve RVOL
+                    hist_vol = v_series.iloc[:-1].tail(20)
                     vol_avg = float(hist_vol.mean())
                     vol_std = float(hist_vol.std()) if len(hist_vol) > 1 else 1.0
                     rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
                     vol_z = float(np.clip((vol_today - vol_avg) / (vol_std + 1e-9), -3, 3))
                     
-                    # 2. Hacim Hızlanması (Son 3 gün ortalamasına göre artış)
+                    # 2. Hacim İvmesi (Son 3 gün ortalamasına göre)
                     vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
                     vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
 
-                    # 3. Kapanış Gücü (Günün en yükseğine yakın kapatma)
+                    # 3. Kapanış Gücü (Günün en tepesine yakın kapatma)
                     high_today = float(h_series.iloc[-1])
                     low_today = float(l_series.iloc[-1])
                     candle_range = high_today - low_today
                     close_strength = (close_today - low_today) / (candle_range + 1e-9) if candle_range > 0 else 0.7
 
-                    # 4. Saf Fiyat Momentumları
-                    mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100) if len(p_series) >= 3 else change_pct
+                    # 4. Kısa ve Orta Vade İvmeler
+                    mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100)
                     mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
-                    mom_20d = float((close_today / p_series.iloc[0] - 1) * 100) # 1 Aylık Genel Trend
+                    mom_1mo = float((close_today / p_series.iloc[-20] - 1) * 100) # 1 Aylık Değişim
+                    mom_3mo = float((close_today / p_series.iloc[0] - 1) * 100)   # 3 Aylık Makro Trend
 
-                    # 5. DÜŞÜŞ TRENDİ FİLTRESİ (1 Aylık Zirveye Yakınlık Oranı)
-                    # 1 aylık tepeye yakınsa yükseliş trendindedir; tabana yakınsa düşüş trendindedir.
-                    high_1mo = float(p_series.max())
-                    low_1mo = float(p_series.min())
-                    trend_range = high_1mo - low_1mo
-                    trend_position = (close_today - low_1mo) / (trend_range + 1e-9) if trend_range > 0 else 0.5
+                    # 5. 3 AYLIK MAKRO ZİRVE / DİP POZİSYONU (Macro Trend Range)
+                    high_3mo = float(p_series.max())
+                    low_3mo = float(p_series.min())
+                    range_3mo = high_3mo - low_3mo
+                    macro_position = (close_today - low_3mo) / (range_3mo + 1e-9) if range_3mo > 0 else 0.5
 
                     df_bugun.append({
                         "ticker": t,
@@ -90,9 +90,10 @@ def gunluk_veri_cek(tickers):
                         "vol_accel": round(vol_accel, 2),
                         "mom_3d": round(mom_3d, 2),
                         "mom_5d": round(mom_5d, 2),
-                        "mom_20d": round(mom_20d, 2),
+                        "mom_1mo": round(mom_1mo, 2),
+                        "mom_3mo": round(mom_3mo, 2),
                         "close_strength": round(close_strength, 2),
-                        "trend_position": round(trend_position, 2)
+                        "macro_position": round(macro_position, 2)
                     })
                     
         return pd.DataFrame(df_bugun)
@@ -105,8 +106,8 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Sadece gerçek yükseliş trendinde olan ve hacim patlaması yaşayan hisseleri
-    öne çıkarır; düşüş trendindeki saman alevlerini (CAN, BEAM vb.) eler.
+    Sadece 3 aylık makro trendi güçlü olan hisseleri listeler;
+    düşüş trendindeki sahte zıplamaları (CAN, BEAM vb.) tamamen eler.
     """
     if df.empty: 
         return df
@@ -117,8 +118,9 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     if 'close_strength' not in df.columns: df['close_strength'] = 0.7
     if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
     if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
-    if 'mom_20d' not in df.columns: df['mom_20d'] = 0.0
-    if 'trend_position' not in df.columns: df['trend_position'] = 0.5
+    if 'mom_1mo' not in df.columns: df['mom_1mo'] = 0.0
+    if 'mom_3mo' not in df.columns: df['mom_3mo'] = 0.0
+    if 'macro_position' not in df.columns: df['macro_position'] = 0.5
 
     df['rvol_ratio'] = df['rvol']
     df['option_oi'] = df['rvol']
@@ -126,43 +128,41 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     # 1. Hacim Gücü Skoru (0 - 100)
     rvol_score = np.clip(((df['rvol'] - 0.5) / 2.5 * 60) + ((df['vol_accel'] - 0.5) / 2.0 * 40), 10, 100)
 
-    # 2. Çok Zamanlı Momentum (0 - 100)
-    mom_score = np.clip(50 + (df['change_%'] * 2.5) + (df['mom_3d'] * 1.5) + (df['mom_5d'] * 1.0), 0, 100)
+    # 2. Çoklu Momentum Skoru (0 - 100)
+    mom_score = np.clip(50 + (df['change_%'] * 2.0) + (df['mom_3d'] * 1.5) + (df['mom_5d'] * 1.0) + (df['mom_1mo'] * 0.5), 0, 100)
 
-    # 3. Yükseliş Trendi ve Kalite Çarpanı (Anti-Düşüş Trendi Filtresi)
-    quality_mult = []
+    # 3. KESİN DÜŞÜŞ TRENDİ ELİYİCİ (Macro Trend Filter)
+    trend_multiplier = []
     for _, row in df.iterrows():
         mult = 1.0
         
-        # Kural 1: 1 Aylık trendi eksideyse (Düşen hisse tepki veriyor - CAN / BEAM gibi)
-        if row['mom_20d'] < -5.0:
-            mult *= 0.40  # %60 Sert Puan Kırma Cezası
-        elif row['mom_20d'] > 5.0:
-            mult *= 1.15  # Yükseliş trendinde olan hisseye bonus
+        # KURAL A: 3 Aylık trendi eksideyse veya 3 aylık dipte sürünüyorsa (CAN, BEAM Elenir)
+        if row['mom_3mo'] < -10.0 or row['macro_position'] < 0.40:
+            mult *= 0.20  # Puanı %80 kır (Doğrudan liste dışı kalır)
+        elif row['mom_3mo'] > 15.0 and row['macro_position'] >= 0.70:
+            mult *= 1.25  # Gerçekten yükselen trend liderlerine büyük bonus
 
-        # Kural 2: 1 Aylık tabanına yakınsa (Dipte sürünüyorsa)
-        if row['trend_position'] < 0.35:
-            mult *= 0.50  # %50 Ceza
-        elif row['trend_position'] >= 0.70:
-            mult *= 1.20  # Zirveye yakın güçlü hisseye bonus
+        # KURAL B: 1 Aylık trendi eksideyse
+        if row['mom_1mo'] < 0:
+            mult *= 0.50
 
-        # Kural 3: Günün tepesinden mal boşaltıldıysa
+        # KURAL C: Günün en tepesinden satış yediyse
         if row['close_strength'] < 0.40:
             mult *= 0.60
         elif row['close_strength'] >= 0.75:
             mult *= 1.10
 
-        # Kural 4: Günlük eksi kapattıysa
+        # KURAL D: Günlük eksi kapattıysa
         if row['change_%'] < 0:
-            mult *= 0.40
+            mult *= 0.30
 
-        quality_mult.append(mult)
+        trend_multiplier.append(mult)
 
-    quality_factor = np.array(quality_mult)
+    quality_factor = np.array(trend_multiplier)
 
     # 4. Göstergeler (Telegram ve Streamlit)
     df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['trend_position'] * 100).round(1)  # Skew alanında artık hissenin 'Trend Gücü %'si yazar
+    df['pct_skew'] = (df['macro_position'] * 100).round(1)  # Skew sütunu artık '3 Aylık Trend Gücü %'yi gösterir
 
     # 5. Squeeze ve Insider Verileri
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
