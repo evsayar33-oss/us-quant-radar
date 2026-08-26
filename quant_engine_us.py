@@ -8,14 +8,14 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    Hisselerin 6 aylık verisini çeker. 
-    Anlık hacim patlaması (RVOL) ve şok kırılım noktalarını yakalamak için optimize edilmiştir.
+    Tek günlük sahte hacim patlamalarını (Fakeout) elemek için;
+    Hacmin sadece bugün değil, son 3-5 gündür de kalıcı olarak yüksek olup olmadığını (Persistence) ölçer.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 6 aylık veri kısa vadeli patlamaları yakalamak için en ideal süredir
+        # 6 aylık veriyi toplu indir
         data = yf.download(tickers, period="6mo", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
@@ -44,57 +44,68 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 30 and len(v_series) >= 30:
+                if len(p_series) >= 60 and len(v_series) >= 60:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. KURAL: Kuruşluk çöpleri ve aşırı sığ tahtaları ele ($5 altı ve $2M altı hacim)
+                    # Kuruşluk çöpleri ve sığ tahtaları ele ($5 altı ve $2M altı hacim)
                     dollar_volume = close_today * vol_today
                     if close_today < 5.0 or dollar_volume < 2_000_000:
                         continue
 
-                    # 20 Günlük Ortalama Hacim ve RVOL (Hacim Patlaması)
+                    # 20 Günlük Ortalama Hacim Tabanı
                     hist_vol = v_series.iloc[:-1].tail(20)
                     vol_avg = float(hist_vol.mean())
-                    rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
+                    if vol_avg <= 0: continue
 
-                    # 2. KURAL: Hacim patlaması yaşamayan (RVOL < 1.1) durgun hisseleri ele
-                    if rvol < 1.10:
+                    # 1. RVOL (Bugünkü Hacim Patlaması)
+                    rvol_today = vol_today / vol_avg
+
+                    # 2. 3 GÜNLÜK HACİM KALICILIĞI (Multi-Day Volume Persistence): 
+                    # Hacim sadece bugün mü patladı, yoksa son 3 gündür de yüksek mi?
+                    vol_3d_avg = float(v_series.iloc[-3:].mean())
+                    rvol_3d = vol_3d_avg / vol_avg
+
+                    # Trend Kapısı (3 aylık getiri ve 6 aylık makro konum)
+                    mom_3mo = float((close_today / p_series.iloc[-63] - 1) * 100) if len(p_series) >= 63 else 0.0
+                    high_6mo = float(p_series.max())
+                    low_6mo = float(p_series.min())
+                    range_6mo = high_6mo - low_6mo
+                    macro_position = (close_today - low_6mo) / (range_6mo + 1e-9) if range_6mo > 0 else 0.5
+
+                    # Kötü trendlileri kapıdan at
+                    if mom_3mo < -2.0 or macro_position < 0.45:
                         continue
 
-                    # Hacim Hızlanması (Son 3 gün ortalamasına göre)
-                    vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
-                    vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
+                    # Sıkı Hacim Filtresi: Tek günlük sahte patlamaları (RVOL < 1.10 veya 3 günlük ortalaması düşük olanları) ele
+                    if rvol_today < 1.10 or rvol_3d < 1.05:
+                        continue
 
-                    # Kapanış Gücü (Günün en tepesine yakın kapatma)
+                    # Kapanış Gücü
                     high_today = float(h_series.iloc[-1])
                     low_today = float(l_series.iloc[-1])
                     candle_range = high_today - low_today
                     close_strength = (close_today - low_today) / (candle_range + 1e-9) if candle_range > 0 else 0.7
 
-                    # Kısa Vadeli Şok İvmeleri (1 Günlük, 3 Günlük, 5 Günlük)
+                    # İstikrarlı Çoklu Zaman İvmeleri (1G, 3G, 5G, 1A)
                     mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100) if len(p_series) >= 3 else change_pct
                     mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100) if len(p_series) >= 5 else change_pct
                     mom_1mo = float((close_today / p_series.iloc[-20] - 1) * 100) if len(p_series) >= 20 else change_pct
-
-                    # 6 Aylık Zirveye Yakınlık
-                    high_6mo = float(p_series.max())
-                    dist_from_high = (close_today / high_6mo - 1) * 100
 
                     df_bugun.append({
                         "ticker": t,
                         "close": round(close_today, 2),
                         "volume": vol_today,
                         "change_%": round(change_pct, 2),
-                        "rvol": round(rvol, 2),
-                        "vol_accel": round(vol_accel, 2),
+                        "rvol": round(rvol_today, 2),
+                        "rvol_3d": round(rvol_3d, 2),
                         "mom_3d": round(mom_3d, 2),
                         "mom_5d": round(mom_5d, 2),
                         "mom_1mo": round(mom_1mo, 2),
-                        "dist_high": round(dist_from_high, 2),
-                        "close_strength": round(close_strength, 2)
+                        "close_strength": round(close_strength, 2),
+                        "macro_position": round(macro_position, 2)
                     })
                     
         return pd.DataFrame(df_bugun)
@@ -107,63 +118,69 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Şok Patlama ve Kırılım Noktası Odaklı Puanlama Motoru:
-    Ağırlıklar: %40 Anlık Hacim Patlaması (RVOL) + %35 Kısa Vadeli Şok İvme + %25 Squeeze Potansiyeli
+    Hacmin sürekliliğine (Persistence) ve istikrarlı basamak ivmesine göre puanlar.
+    Tek günlük hacim tuzaklarını en alta atar.
     """
     if df.empty: 
         return df
 
     if 'rvol' not in df.columns: df['rvol'] = 1.0
-    if 'vol_accel' not in df.columns: df['vol_accel'] = 1.0
+    if 'rvol_3d' not in df.columns: df['rvol_3d'] = 1.0
     if 'close_strength' not in df.columns: df['close_strength'] = 0.7
     if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
     if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
     if 'mom_1mo' not in df.columns: df['mom_1mo'] = 0.0
-    if 'dist_high' not in df.columns: df['dist_high'] = -20.0
+    if 'macro_position' not in df.columns: df['macro_position'] = 0.5
 
     df['rvol_ratio'] = df['rvol']
     df['option_oi'] = df['rvol']
 
-    # 1. Hacim Patlaması Skoru (0 - 100) -> RVOL ne kadar yüksekse o kadar iyi!
-    rvol_score = np.clip(((df['rvol'] - 1.0) / 3.0 * 70) + ((df['vol_accel'] - 1.0) / 2.0 * 30), 10, 100)
+    # 1. Hacim Kalıcılık Skoru (Bugünkü RVOL + Son 3 Günlük RVOL Ortalaması)
+    persistence_score = np.clip(((df['rvol'] - 1.0) / 3.0 * 50) + ((df['rvol_3d'] - 1.0) / 2.0 * 50), 10, 100)
 
-    # 2. Kısa Vadeli Şok İvme Skoru (0 - 100) -> Bugün ve son 3 gündeki agresif hareketler
+    # 2. İstikrarlı Basamak İvme Skoru (1G, 3G, 5G, 1A pozitif uyum)
     mom_score = np.clip(
         40 + 
-        (df['change_%'] * 3.5) + 
+        (df['change_%'] * 2.0) + 
         (df['mom_3d'] * 1.5) + 
-        (df['mom_5d'] * 0.8), 
+        (df['mom_5d'] * 1.0) + 
+        (df['mom_1mo'] * 0.5), 
         0, 100
     )
 
-    # 3. ŞOK PATLAMA ÇARPANI (Ignition Multiplier)
-    ignition_mult = []
+    # 3. DEVAMLILIK ÇARPANI (Continuation Multiplier)
+    continuation_mult = []
     for _, row in df.iterrows():
         mult = 1.0
         
-        # Alev alan hacim bonusu (RVOL 2.5 kat ve üzeriyse patlama noktasıdır)
-        if row['rvol'] >= 2.5:
+        # Eğer hacim hem bugün hem de son 3 gündür ortalamanın çok üzerindeyse (Gerçek Akümülasyon)
+        if row['rvol'] >= 2.0 and row['rvol_3d'] >= 1.5:
             mult *= 1.35
-        elif row['rvol'] >= 1.8:
-            mult *= 1.15
+        # Eğer sadece bugün patlayıp dün hacimsizse (Tek günlük şüphe / Fakeout)
+        elif row['rvol'] >= 2.0 and row['rvol_3d'] < 1.2:
+            mult *= 0.75 # Cezalandırılır
 
-        # Günün en tepesine yakın kapattıysa (Alıcılar tahtayı devretmemiş)
-        if row['close_strength'] >= 0.80:
+        # Trend ne kadar güçlüyse
+        if row['macro_position'] >= 0.75:
             mult *= 1.20
+
+        # Kapanış gücü
+        if row['close_strength'] >= 0.80:
+            mult *= 1.15
         elif row['close_strength'] < 0.40:
-            mult *= 0.60 # Tepeden satış yemişse cezalandır
+            mult *= 0.50
 
-        # Günlük eksi kapatanlar patlama yapamaz, cezalandırılır
+        # Günlük eksi kapatanlar
         if row['change_%'] < 0:
-            mult *= 0.20
+            mult *= 0.10
 
-        ignition_mult.append(mult)
+        continuation_mult.append(mult)
 
-    quality_factor = np.array(ignition_mult)
+    quality_factor = np.array(continuation_mult)
 
     # 4. Göstergeler (Telegram ve Streamlit)
     df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['rvol'] * 50).round(1) # Skew alanında 'Hacim Çarpanı' görünür
+    df['pct_skew'] = (df['rvol_3d'] * 50).round(1) # Skew alanında '3 Günlük Ortalama Hacim Çarpanı' yazar
 
     # 5. Squeeze ve Insider Verileri
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
@@ -177,8 +194,8 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     else:
         df['insider_bonus'] = 0.0
 
-    # 6. Final Quant Skoru (Ağırlıklar: %40 RVOL, %35 Kısa Vade İvme, %25 Squeeze)
-    base_score = (rvol_score * 0.40) + (mom_score * 0.35) + (df['squeeze_skor'] * 0.25)
+    # 6. Final Quant Skoru
+    base_score = (persistence_score * 0.40) + (mom_score * 0.35) + (df['squeeze_skor'] * 0.25)
     final_score = (base_score * quality_factor) + df['insider_bonus']
     df['quant_score'] = np.clip(final_score, 0, 100).round(1)
 
