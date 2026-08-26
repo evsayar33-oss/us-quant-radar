@@ -8,8 +8,8 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    Son 6 aylık fiyat hareketinin 'Zikzak / Testere' mi yoksa 
-    'Temiz Süper Trend' mi olduğunu matematiksel olarak test eder (R-Squared).
+    1 Yıllık veriyi çeker. Sadece aşırı çöp hisseleri (Fiyat < $3, Hacim yok) eler.
+    Diğer tüm hisseleri tutar ancak aşağıda puanlama ile testere olanları dibe batırır.
     """
     try:
         if not tickers:
@@ -44,25 +44,29 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 120 and len(v_series) >= 120:
+                if len(p_series) >= 60 and len(v_series) >= 60:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. KURAL: Minimum Fiyat $5 ve Günlük Dolar Hacmi > $5M
+                    # Sadece mutlak çöpleri at ($3 altı ve hacimsizler)
                     dollar_volume = close_today * vol_today
-                    if close_today < 5.0 or dollar_volume < 5_000_000:
+                    if close_today < 3.0 or dollar_volume < 2_000_000:
                         continue
 
-                    # 2. KURAL: 52 Haftalık Zirvesine Yakınlık (En azından zirvesine %20 yakın olmalı)
+                    # Çoklu Zaman Dilimi Getirileri (1 Yıllık, 6 Aylık, 3 Aylık, 1 Aylık, 5 Günlük)
+                    mom_1y = float((close_today / p_series.iloc[0] - 1) * 100)
+                    mom_6mo = float((close_today / p_series.iloc[-126] - 1) * 100) if len(p_series) >= 126 else mom_1y
+                    mom_3mo = float((close_today / p_series.iloc[-63] - 1) * 100) if len(p_series) >= 63 else mom_6mo
+                    mom_1mo = float((close_today / p_series.iloc[-21] - 1) * 100) if len(p_series) >= 21 else mom_3mo
+                    mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
+
+                    # 52 Haftalık Zirveye Uzaklık
                     high_52w = float(p_series.max())
                     dist_from_high = (close_today / high_52w - 1) * 100
-                    if dist_from_high < -20.0:
-                        continue
 
-                    # 3. KURAL (TESTERE KATİLİ - R-Squared / Trend Temizliği):
-                    # Son 6 aylık (126 işlem günü) fiyat hareketinin zikzak oranını ölçüyoruz.
+                    # Trend Temizliği (R-Squared)
                     p_126 = p_series.tail(126)
                     y = np.log(p_126.values)
                     x = np.arange(len(y))
@@ -71,27 +75,11 @@ def gunluk_veri_cek(tickers):
                     ss_res = np.sum((y - y_pred) ** 2)
                     ss_tot = np.sum((y - np.mean(y)) ** 2)
                     r_squared = 1 - (ss_res / (ss_tot + 1e-9))
-                    
-                    # Eğer R-squared 0.50'den küçükse, o hisse dağınık ve testere piyasasındadır -> DOĞRUDAN ELE!
-                    if r_squared < 0.50:
-                        continue
 
-                    # 4. KURAL: Çoklu Zaman Dilimi Pozitif İvme
-                    mom_1y = float((close_today / p_series.iloc[0] - 1) * 100)
-                    mom_6mo = float((close_today / p_series.iloc[-126] - 1) * 100)
-                    mom_3mo = float((close_today / p_series.iloc[-63] - 1) * 100)
-                    mom_1mo = float((close_today / p_series.iloc[-21] - 1) * 100)
-                    mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
-
-                    if mom_1y < 10.0 or mom_6mo < 5.0 or mom_3mo < 0.0:
-                        continue
-
-                    # RVOL Kontrolü
+                    # RVOL (Göreceli Hacim)
                     hist_vol = v_series.iloc[:-1].tail(20)
                     vol_avg = float(hist_vol.mean())
                     rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
-                    if rvol < 0.90:
-                        continue
 
                     vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
                     vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
@@ -128,8 +116,9 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Sadece 'Trend Temizliği (R-Squared)' yüksek olan, zikzak çizmeyen 
-    gerçek süper trend hisselerini puanlar.
+    Sert silme (continue) yerine 'Ceza Puanı (Soft Penalty)' sistemi kullanır.
+    Yatay / Testere hisselerin puanı %70 kesilerek dibe batırılır; 
+    1 yıllık getirisi yüksek gerçek liderler zirvede tutulur.
     """
     if df.empty: 
         return df
@@ -141,7 +130,9 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
     if 'mom_1mo' not in df.columns: df['mom_1mo'] = 0.0
     if 'mom_3mo' not in df.columns: df['mom_3mo'] = 0.0
+    if 'mom_6mo' not in df.columns: df['mom_6mo'] = 0.0
     if 'mom_1y' not in df.columns: df['mom_1y'] = 0.0
+    if 'dist_high' not in df.columns: df['dist_high'] = -20.0
 
     df['rvol_ratio'] = df['rvol']
     df['option_oi'] = df['rvol']
@@ -149,32 +140,36 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     # 1. Hacim Gücü Skoru (0 - 100)
     rvol_score = np.clip(((df['rvol'] - 0.5) / 2.5 * 60) + ((df['vol_accel'] - 0.5) / 2.0 * 40), 10, 100)
 
-    # 2. Momentum Skoru (0 - 100)
+    # 2. Uzun Vadeli Bileşik Momentum Skoru (0 - 100) - 1 Yıllık Getiriye Büyük Ağırlık!
     mom_score = np.clip(
-        40 + 
-        (df['change_%'] * 2.0) + 
-        (df['mom_5d'] * 1.0) + 
-        (df['mom_1mo'] * 0.4) + 
+        30 + 
+        (df['mom_1y'] * 0.3) + 
+        (df['mom_6mo'] * 0.2) + 
         (df['mom_3mo'] * 0.2) + 
-        (df['mom_1y'] * 0.1), 
+        (df['change_%'] * 1.5), 
         0, 100
     )
 
-    # 3. Trend Temizliği ve Kapanış Çarpanı
+    # 3. TESTERE VE YATAY PİYASA CEZA ÇARPANI (Soft Penalty)
     trend_multiplier = []
     for _, row in df.iterrows():
         mult = 1.0
         
-        # Trend ne kadar temiz ve zikzaksızsa (R-Squared yüksekse) o kadar büyük bonus
-        purity = row['trend_purity']
-        if purity >= 0.75:
-            mult *= 1.30
-        elif purity >= 0.60:
-            mult *= 1.15
-            
-        # Zirveye yakınlık
-        if row['dist_high'] >= -5.0:
-            mult *= 1.20
+        # TESTERE FİLTRESİ: 1 yıllık getirisi %15'in altında olan (yerinde sayan A, BBY, ESS gibi) hisselere ağır ceza!
+        if row['mom_1y'] < 15.0:
+            mult *= 0.30  # Puanı %70 kırıp dibe batırır
+        elif row['mom_1y'] > 40.0:
+            mult *= 1.30  # Gerçek uzun vadeli süper trend liderlerine büyük bonus
+
+        # Zikzak (R-squared) düşükse ceza
+        if row['trend_purity'] < 0.45:
+            mult *= 0.50
+
+        # Zirveden çok uzaksa ceza
+        if row['dist_high'] < -25.0:
+            mult *= 0.60
+        elif row['dist_high'] >= -8.0:
+            mult *= 1.20 # Yeni ATH / Zirve kırılımı bonusu
 
         # Kapanış gücü
         if row['close_strength'] < 0.40:
@@ -192,7 +187,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
 
     # 4. Göstergeler (Telegram ve Streamlit)
     df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['trend_purity'] * 100).round(1) # Skew alanında 'Trend Temizliği %' yazar
+    df['pct_skew'] = (df['mom_1y']).round(1) # Skew alanında artık 1 yıllık net getiri %'si yazar
 
     # 5. Squeeze ve Insider Verileri
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
@@ -207,7 +202,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
         df['insider_bonus'] = 0.0
 
     # 6. Final Quant Skoru
-    base_score = (rvol_score * 0.30) + (mom_score * 0.45) + (df['squeeze_skor'] * 0.25)
+    base_score = (rvol_score * 0.25) + (mom_score * 0.50) + (df['squeeze_skor'] * 0.25)
     final_score = (base_score * quality_factor) + df['insider_bonus']
     df['quant_score'] = np.clip(final_score, 0, 100).round(1)
 
