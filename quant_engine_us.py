@@ -8,15 +8,15 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    6 Aylık makro trendi çeker.
-    $5 altındaki kuruşluk hisseleri ve genel trendi düşüş olanları doğrudan eler.
+    1 Yıllık makro veriyi toplu indirir.
+    BYND gibi ölü, hacimsiz (RVOL < 1.0) ve zirvesinden çökmüş hisseleri doğrudan eler.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 6 aylık veriyi tek seferde toplu çekiyoruz
-        data = yf.download(tickers, period="6mo", interval="1d", progress=False, group_by='column')
+        # 1 Yıllık veriyi tek toplu istekte indir
+        data = yf.download(tickers, period="1y", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
 
@@ -44,34 +44,41 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 30 and len(v_series) >= 30:
+                if len(p_series) >= 60 and len(v_series) >= 60:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. SERT ELEME: $3.00 altındaki kuruşluk hisseleri doğrudan at
-                    if close_today < 3.0:
+                    # 1. KURAL: Minimum Fiyat $5
+                    if close_today < 5.0:
                         continue
 
-                    # 2. SERT ELEME: 6 Aylık Zirvesinden %40'tan fazla düşmüş 'Düşen Bıçakları' doğrudan at (CAN, BEAM Elenir)
-                    high_6mo = float(p_series.max())
-                    drawdown_from_high = (close_today / high_6mo - 1) * 100
-                    if drawdown_from_high < -35.0:
+                    # 2. KURAL: 1 Yıllık Zirvesinden %50'den fazla çökmüş zombi hisseleri at (BYND Elenir)
+                    high_1y = float(p_series.max())
+                    drawdown_1y = (close_today / high_1y - 1) * 100
+                    if drawdown_1y < -45.0:
                         continue
 
-                    # 20 Günlük Hacim ve RVOL
+                    # 20 Günlük Ortalama Hacim ve RVOL
                     hist_vol = v_series.iloc[:-1].tail(20)
                     vol_avg = float(hist_vol.mean())
-                    vol_std = float(hist_vol.std()) if len(hist_vol) > 1 else 1.0
                     rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
-                    vol_z = float(np.clip((vol_today - vol_avg) / (vol_std + 1e-9), -3, 3))
-                    
+
+                    # 3. KURAL: Hacim Patlaması Olmayan (RVOL < 1.0) Ölü Hisseleri At (BYND RVOL 0.06 olduğu için elenir)
+                    if rvol < 1.0:
+                        continue
+
+                    # 4. KURAL: Günlük Dolar Hacmi $5M altı olan sığ hisseleri at
+                    dollar_volume = close_today * vol_today
+                    if dollar_volume < 5_000_000:
+                        continue
+
                     # Hacim İvmesi
                     vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
                     vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
 
-                    # Kapanış Gücü
+                    # Kapanış Gücü (Günün en tepesine yakın kapatma)
                     high_today = float(h_series.iloc[-1])
                     low_today = float(l_series.iloc[-1])
                     candle_range = high_today - low_today
@@ -81,12 +88,12 @@ def gunluk_veri_cek(tickers):
                     mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100)
                     mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
                     mom_1mo = float((close_today / p_series.iloc[-20] - 1) * 100)
-                    mom_3mo = float((close_today / p_series.iloc[-60] - 1) * 100) if len(p_series) >= 60 else mom_1mo
+                    mom_3mo = float((close_today / p_series.iloc[-60] - 1) * 100)
 
-                    # 6 Aylık Göreceli Güç (Zirveye yakınlık: 0 ile 1 arası)
-                    low_6mo = float(p_series.min())
-                    range_6mo = high_6mo - low_6mo
-                    macro_position = (close_today - low_6mo) / (range_6mo + 1e-9) if range_6mo > 0 else 0.5
+                    # 1 Yıllık Trend Konumu (0 ile 1 arası)
+                    low_1y = float(p_series.min())
+                    range_1y = high_1y - low_1y
+                    macro_position = (close_today - low_1y) / (range_1y + 1e-9) if range_1y > 0 else 0.5
 
                     df_bugun.append({
                         "ticker": t,
@@ -94,7 +101,6 @@ def gunluk_veri_cek(tickers):
                         "volume": vol_today,
                         "change_%": round(change_pct, 2),
                         "rvol": round(rvol, 2),
-                        "vol_z": round(vol_z, 2),
                         "vol_accel": round(vol_accel, 2),
                         "mom_3d": round(mom_3d, 2),
                         "mom_5d": round(mom_5d, 2),
@@ -102,7 +108,7 @@ def gunluk_veri_cek(tickers):
                         "mom_3mo": round(mom_3mo, 2),
                         "close_strength": round(close_strength, 2),
                         "macro_position": round(macro_position, 2),
-                        "drawdown": round(drawdown_from_high, 2)
+                        "drawdown_1y": round(drawdown_1y, 2)
                     })
                     
         return pd.DataFrame(df_bugun)
@@ -115,13 +121,13 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Sadece 6 aylık trendi sağlam, yükseliş kanalındaki güçlü hisseleri puanlar.
+    Sadece 1 yıllık trendi güçlü, taze hacim patlaması (RVOL >= 1.0) yaşayan
+    ve yükselen hisseleri puanlar.
     """
     if df.empty: 
         return df
 
     if 'rvol' not in df.columns: df['rvol'] = 1.0
-    if 'vol_z' not in df.columns: df['vol_z'] = 0.0
     if 'vol_accel' not in df.columns: df['vol_accel'] = 1.0
     if 'close_strength' not in df.columns: df['close_strength'] = 0.7
     if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
@@ -144,8 +150,8 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     for _, row in df.iterrows():
         mult = 1.0
         
-        # 3 Aylık getirisi pozitif ve zirvesine yakın olan gerçek trend liderleri
-        if row['mom_3mo'] > 10.0 and row['macro_position'] >= 0.65:
+        # 3 Aylık getirisi pozitif ve yıllık zirvesine yakın güçlü hisseler
+        if row['mom_3mo'] > 10.0 and row['macro_position'] >= 0.60:
             mult *= 1.25
         elif row['mom_3mo'] < 0:
             mult *= 0.40
@@ -168,7 +174,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     df['pct_oi_mom'] = mom_score.round(1)
     df['pct_skew'] = (df['macro_position'] * 100).round(1)
 
-    # 5. Squeeze ve Insider Verileri
+    # 5. Squeeze ve Insider Verilerini Birleştir
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
         df = df.merge(df_yapisal[['ticker', 'squeeze_skor']], on='ticker', how='left')
         df['squeeze_skor'] = df['squeeze_skor'].fillna(50.0)
