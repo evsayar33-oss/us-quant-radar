@@ -8,19 +8,19 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    İndikatör kullanmadan saf Fiyat/Hacim İvmesini, Hacim Hızlanmasını (Acceleration)
-    ve Kapanış Gücünü hesaplar.
+    Hisselerin fiyat, hacim ve orta vadeli yapısal trendini çeker.
+    Düşüş trendindeki 'düşen bıçak' hisseleri tespit edip eler.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 1 aylık ham veriyi tek toplu istekte çek
+        # 1 aylık ham veriyi tek seferde çek
         data = yf.download(tickers, period="1mo", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
 
-        # Sütunları ayıkla
+        # Sütunları güvenle ayıkla
         if isinstance(data.columns, pd.MultiIndex):
             closes = data['Close'].ffill() if 'Close' in data.columns.levels[0] else pd.DataFrame()
             volumes = data['Volume'].ffill() if 'Volume' in data.columns.levels[0] else pd.DataFrame()
@@ -44,33 +44,41 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 5 and len(v_series) >= 5:
+                if len(p_series) >= 10 and len(v_series) >= 10:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. 20 Günlük Taban Hacme Göre RVOL
+                    # 1. Taban Hacim ve RVOL (Bugünkü Hacim / 20 Günlük Ortalama)
                     hist_vol = v_series.iloc[:-1].tail(20) if len(v_series) > 5 else v_series
                     vol_avg = float(hist_vol.mean())
                     vol_std = float(hist_vol.std()) if len(hist_vol) > 1 else 1.0
                     rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
                     vol_z = float(np.clip((vol_today - vol_avg) / (vol_std + 1e-9), -3, 3))
                     
-                    # 2. HACİM İVMESİ (Volume Acceleration): Bugünkü hacim / Son 3 gün ortalaması
+                    # 2. Hacim Hızlanması (Son 3 gün ortalamasına göre artış)
                     vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
                     vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
 
-                    # 3. KAPANIS GÜCÜ: Günün en tepesine yakın kapatma oranı (0 ile 1 arası)
+                    # 3. Kapanış Gücü (Günün en yükseğine yakın kapatma)
                     high_today = float(h_series.iloc[-1])
                     low_today = float(l_series.iloc[-1])
                     candle_range = high_today - low_today
                     close_strength = (close_today - low_today) / (candle_range + 1e-9) if candle_range > 0 else 0.7
 
-                    # 4. ÇOK ZAMANLI SAF FİYAT MOMENTUMU (1G, 3G, 5G)
+                    # 4. Saf Fiyat Momentumları
                     mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100) if len(p_series) >= 3 else change_pct
                     mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
+                    mom_20d = float((close_today / p_series.iloc[0] - 1) * 100) # 1 Aylık Genel Trend
+
+                    # 5. DÜŞÜŞ TRENDİ FİLTRESİ (1 Aylık Zirveye Yakınlık Oranı)
+                    # 1 aylık tepeye yakınsa yükseliş trendindedir; tabana yakınsa düşüş trendindedir.
+                    high_1mo = float(p_series.max())
+                    low_1mo = float(p_series.min())
+                    trend_range = high_1mo - low_1mo
+                    trend_position = (close_today - low_1mo) / (trend_range + 1e-9) if trend_range > 0 else 0.5
 
                     df_bugun.append({
                         "ticker": t,
@@ -82,7 +90,9 @@ def gunluk_veri_cek(tickers):
                         "vol_accel": round(vol_accel, 2),
                         "mom_3d": round(mom_3d, 2),
                         "mom_5d": round(mom_5d, 2),
-                        "close_strength": round(close_strength, 2)
+                        "mom_20d": round(mom_20d, 2),
+                        "close_strength": round(close_strength, 2),
+                        "trend_position": round(trend_position, 2)
                     })
                     
         return pd.DataFrame(df_bugun)
@@ -95,8 +105,8 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Saf Momentum + Hacim Hızlanması + Squeeze Sıkışması ile
-    hareketin devam etme gücünü puanlar.
+    Sadece gerçek yükseliş trendinde olan ve hacim patlaması yaşayan hisseleri
+    öne çıkarır; düşüş trendindeki saman alevlerini (CAN, BEAM vb.) eler.
     """
     if df.empty: 
         return df
@@ -107,46 +117,54 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     if 'close_strength' not in df.columns: df['close_strength'] = 0.7
     if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
     if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
+    if 'mom_20d' not in df.columns: df['mom_20d'] = 0.0
+    if 'trend_position' not in df.columns: df['trend_position'] = 0.5
 
     df['rvol_ratio'] = df['rvol']
     df['option_oi'] = df['rvol']
 
-    # 1. Hacim Patlaması & Hızlanması Puanı (0 - 100)
-    # RVOL ve 3 günlük hacim ivmesi ne kadar yüksekse puan o kadar artar
+    # 1. Hacim Gücü Skoru (0 - 100)
     rvol_score = np.clip(((df['rvol'] - 0.5) / 2.5 * 60) + ((df['vol_accel'] - 0.5) / 2.0 * 40), 10, 100)
 
-    # 2. Saf Çoklu Zaman Momentum Puanı (0 - 100)
-    # %40 Günlük Kırılım + %35 3 Günlük İvme + %25 5 Günlük İvme
-    mom_score = np.clip(50 + (df['change_%'] * 2.5) + (df['mom_3d'] * 1.5) + (df['mom_5d'] * 0.8), 0, 100)
+    # 2. Çok Zamanlı Momentum (0 - 100)
+    mom_score = np.clip(50 + (df['change_%'] * 2.5) + (df['mom_3d'] * 1.5) + (df['mom_5d'] * 1.0), 0, 100)
 
-    # 3. İvme Devamlılığı (Continuation Multiplier)
-    continuation_mult = []
+    # 3. Yükseliş Trendi ve Kalite Çarpanı (Anti-Düşüş Trendi Filtresi)
+    quality_mult = []
     for _, row in df.iterrows():
         mult = 1.0
-        # Tepeden satış yediyse (Tepede fitil bırakan tuzak pump)
-        if row['close_strength'] < 0.40:
-            mult *= 0.65
-        # Günün en tepesine yakın kapattıysa (Alıcılar istekli devralıyor)
-        elif row['close_strength'] >= 0.75:
-            mult *= 1.15
+        
+        # Kural 1: 1 Aylık trendi eksideyse (Düşen hisse tepki veriyor - CAN / BEAM gibi)
+        if row['mom_20d'] < -5.0:
+            mult *= 0.40  # %60 Sert Puan Kırma Cezası
+        elif row['mom_20d'] > 5.0:
+            mult *= 1.15  # Yükseliş trendinde olan hisseye bonus
 
-        # Hacim ivmesi hızlanarak geliyorsa
-        if row['vol_accel'] > 1.5:
+        # Kural 2: 1 Aylık tabanına yakınsa (Dipte sürünüyorsa)
+        if row['trend_position'] < 0.35:
+            mult *= 0.50  # %50 Ceza
+        elif row['trend_position'] >= 0.70:
+            mult *= 1.20  # Zirveye yakın güçlü hisseye bonus
+
+        # Kural 3: Günün tepesinden mal boşaltıldıysa
+        if row['close_strength'] < 0.40:
+            mult *= 0.60
+        elif row['close_strength'] >= 0.75:
             mult *= 1.10
 
-        # Günlük eksi kapattıysa (Hacim mal boşaltma hacmidir)
+        # Kural 4: Günlük eksi kapattıysa
         if row['change_%'] < 0:
-            mult *= 0.50
+            mult *= 0.40
 
-        continuation_mult.append(mult)
+        quality_mult.append(mult)
 
-    continuation_factor = np.array(continuation_mult)
+    quality_factor = np.array(quality_mult)
 
     # 4. Göstergeler (Telegram ve Streamlit)
     df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['close_strength'] * 100).round(1)
+    df['pct_skew'] = (df['trend_position'] * 100).round(1)  # Skew alanında artık hissenin 'Trend Gücü %'si yazar
 
-    # 5. Squeeze ve Insider Verilerini Birleştir
+    # 5. Squeeze ve Insider Verileri
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
         df = df.merge(df_yapisal[['ticker', 'squeeze_skor']], on='ticker', how='left')
         df['squeeze_skor'] = df['squeeze_skor'].fillna(50.0)
@@ -159,9 +177,8 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
         df['insider_bonus'] = 0.0
 
     # 6. Final Quant Skoru
-    # Ağırlıklar: %35 Hacim İvmesi (Volume Acceleration) + %40 Saf Momentum + %25 Squeeze Potansiyeli
     base_score = (rvol_score * 0.35) + (mom_score * 0.40) + (df['squeeze_skor'] * 0.25)
-    final_score = (base_score * continuation_factor) + df['insider_bonus']
+    final_score = (base_score * quality_factor) + df['insider_bonus']
     df['quant_score'] = np.clip(final_score, 0, 100).round(1)
 
     # 7. Skor Farkı Hesabı
