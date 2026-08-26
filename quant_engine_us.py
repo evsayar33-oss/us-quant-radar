@@ -8,19 +8,19 @@ MOM_PENCERE = 5
 
 def gunluk_veri_cek(tickers):
     """
-    1 Yıllık makro veriyi toplu indirir.
-    BYND gibi ölü, hacimsiz (RVOL < 1.0) ve zirvesinden çökmüş hisseleri doğrudan eler.
+    1 Yıllık veriyi çekerek GEN gibi 20 yıllık testere/yatay hisseleri eler.
+    Sadece 1 yıllık, 6 aylık ve 3 aylık grafiği soluksuz yükselen 'Süper Trend' hisselerini seçer.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 1 Yıllık veriyi tek toplu istekte indir
+        # 1 Yıllık veriyi toplu indir
         data = yf.download(tickers, period="1y", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
 
-        # Sütunları ayıkla
+        # Sütunları güvenle ayıkla
         if isinstance(data.columns, pd.MultiIndex):
             closes = data['Close'].ffill() if 'Close' in data.columns.levels[0] else pd.DataFrame()
             volumes = data['Volume'].ffill() if 'Volume' in data.columns.levels[0] else pd.DataFrame()
@@ -44,56 +44,55 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 60 and len(v_series) >= 60:
+                if len(p_series) >= 120 and len(v_series) >= 120:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     vol_today = float(v_series.iloc[-1])
                     
-                    # 1. KURAL: Minimum Fiyat $5
-                    if close_today < 5.0:
+                    # 1. KURAL: Minimum Fiyat $5 ve Günlük Dolar Hacmi > $5M
+                    dollar_volume = close_today * vol_today
+                    if close_today < 5.0 or dollar_volume < 5_000_000:
                         continue
 
-                    # 2. KURAL: 1 Yıllık Zirvesinden %50'den fazla çökmüş zombi hisseleri at (BYND Elenir)
-                    high_1y = float(p_series.max())
-                    drawdown_1y = (close_today / high_1y - 1) * 100
-                    if drawdown_1y < -45.0:
+                    # 2. KURAL (TESTERE KATİLİ): 52 Haftalık Zirveye Yakınlık
+                    # Hisse 1 yıllık zirvesinden en fazla %15 uzakta olabilir (GEN, BYND gibi yatay ve batıklar elenir)
+                    high_52w = float(p_series.max())
+                    dist_from_high = (close_today / high_52w - 1) * 100
+                    if dist_from_high < -15.0:
                         continue
 
-                    # 20 Günlük Ortalama Hacim ve RVOL
+                    # 3. KURAL (UZUN VADELİ TREND): Çoklu Zaman Dilimi Getirileri
+                    mom_1y = float((close_today / p_series.iloc[0] - 1) * 100)
+                    mom_6mo = float((close_today / p_series.iloc[-126] - 1) * 100) if len(p_series) >= 126 else mom_1y
+                    mom_3mo = float((close_today / p_series.iloc[-63] - 1) * 100)
+                    mom_1mo = float((close_today / p_series.iloc[-21] - 1) * 100)
+                    mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
+
+                    # Sıralı Yükseliş Şartı: Yıllık, 6 aylık ve 3 aylık getirisi zayıf/yatay olan testere hisseler elenir
+                    if mom_1y < 15.0 or mom_6mo < 8.0 or mom_3mo < 3.0:
+                        continue
+
+                    # 4. KURAL: RVOL (En az 1.0 ve üzeri olmalı, ölü tahtalar elenir)
                     hist_vol = v_series.iloc[:-1].tail(20)
                     vol_avg = float(hist_vol.mean())
                     rvol = vol_today / (vol_avg + 1e-9) if vol_avg > 0 else 1.0
-
-                    # 3. KURAL: Hacim Patlaması Olmayan (RVOL < 1.0) Ölü Hisseleri At (BYND RVOL 0.06 olduğu için elenir)
-                    if rvol < 1.0:
+                    if rvol < 0.90:
                         continue
 
-                    # 4. KURAL: Günlük Dolar Hacmi $5M altı olan sığ hisseleri at
-                    dollar_volume = close_today * vol_today
-                    if dollar_volume < 5_000_000:
-                        continue
-
-                    # Hacim İvmesi
+                    # Hacim İvmesi & Kapanış Gücü
                     vol_3d_avg = float(v_series.iloc[-4:-1].mean()) if len(v_series) >= 4 else vol_avg
                     vol_accel = vol_today / (vol_3d_avg + 1e-9) if vol_3d_avg > 0 else 1.0
 
-                    # Kapanış Gücü (Günün en tepesine yakın kapatma)
                     high_today = float(h_series.iloc[-1])
                     low_today = float(l_series.iloc[-1])
                     candle_range = high_today - low_today
                     close_strength = (close_today - low_today) / (candle_range + 1e-9) if candle_range > 0 else 0.7
 
-                    # Momentumlar
-                    mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100)
-                    mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100)
-                    mom_1mo = float((close_today / p_series.iloc[-20] - 1) * 100)
-                    mom_3mo = float((close_today / p_series.iloc[-60] - 1) * 100)
-
-                    # 1 Yıllık Trend Konumu (0 ile 1 arası)
-                    low_1y = float(p_series.min())
-                    range_1y = high_1y - low_1y
-                    macro_position = (close_today - low_1y) / (range_1y + 1e-9) if range_1y > 0 else 0.5
+                    # Trend Kalite Puanı (52 Haftalık zirveye ne kadar yakınsa o kadar yüksek)
+                    low_52w = float(p_series.min())
+                    range_52w = high_52w - low_52w
+                    trend_score_52w = (close_today - low_52w) / (range_52w + 1e-9) if range_52w > 0 else 0.5
 
                     df_bugun.append({
                         "ticker": t,
@@ -102,13 +101,14 @@ def gunluk_veri_cek(tickers):
                         "change_%": round(change_pct, 2),
                         "rvol": round(rvol, 2),
                         "vol_accel": round(vol_accel, 2),
-                        "mom_3d": round(mom_3d, 2),
                         "mom_5d": round(mom_5d, 2),
                         "mom_1mo": round(mom_1mo, 2),
                         "mom_3mo": round(mom_3mo, 2),
+                        "mom_6mo": round(mom_6mo, 2),
+                        "mom_1y": round(mom_1y, 2),
+                        "dist_high": round(dist_from_high, 2),
                         "close_strength": round(close_strength, 2),
-                        "macro_position": round(macro_position, 2),
-                        "drawdown_1y": round(drawdown_1y, 2)
+                        "trend_score_52w": round(trend_score_52w, 2)
                     })
                     
         return pd.DataFrame(df_bugun)
@@ -121,8 +121,7 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Sadece 1 yıllık trendi güçlü, taze hacim patlaması (RVOL >= 1.0) yaşayan
-    ve yükselen hisseleri puanlar.
+    Sadece gerçek 'Süper Trend' (Uzun vadeli yükseliş kanalı) hisselerini puanlar.
     """
     if df.empty: 
         return df
@@ -130,11 +129,11 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     if 'rvol' not in df.columns: df['rvol'] = 1.0
     if 'vol_accel' not in df.columns: df['vol_accel'] = 1.0
     if 'close_strength' not in df.columns: df['close_strength'] = 0.7
-    if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
+    if 'trend_score_52w' not in df.columns: df['trend_score_52w'] = 0.5
     if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
     if 'mom_1mo' not in df.columns: df['mom_1mo'] = 0.0
     if 'mom_3mo' not in df.columns: df['mom_3mo'] = 0.0
-    if 'macro_position' not in df.columns: df['macro_position'] = 0.5
+    if 'mom_1y' not in df.columns: df['mom_1y'] = 0.0
 
     df['rvol_ratio'] = df['rvol']
     df['option_oi'] = df['rvol']
@@ -142,29 +141,38 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     # 1. Hacim Gücü Skoru (0 - 100)
     rvol_score = np.clip(((df['rvol'] - 0.5) / 2.5 * 60) + ((df['vol_accel'] - 0.5) / 2.0 * 40), 10, 100)
 
-    # 2. Çoklu Momentum Skoru (0 - 100)
-    mom_score = np.clip(50 + (df['change_%'] * 2.0) + (df['mom_3d'] * 1.5) + (df['mom_5d'] * 1.0) + (df['mom_1mo'] * 0.5), 0, 100)
+    # 2. Çok Zamanlı Süper Trend Momentum Skoru (0 - 100)
+    # 1 Yıllık ve 6 Aylık trend ağırlığı artırıldı
+    mom_score = np.clip(
+        40 + 
+        (df['change_%'] * 2.0) + 
+        (df['mom_5d'] * 1.0) + 
+        (df['mom_1mo'] * 0.4) + 
+        (df['mom_3mo'] * 0.2) + 
+        (df['mom_1y'] * 0.1), 
+        0, 100
+    )
 
-    # 3. Yükseliş Trendi Çarpanı
+    # 3. Zirve Kırılım ve Kalite Çarpanı
     trend_multiplier = []
     for _, row in df.iterrows():
         mult = 1.0
         
-        # 3 Aylık getirisi pozitif ve yıllık zirvesine yakın güçlü hisseler
-        if row['mom_3mo'] > 10.0 and row['macro_position'] >= 0.60:
-            mult *= 1.25
-        elif row['mom_3mo'] < 0:
-            mult *= 0.40
+        # 52 Haftalık Zirvesine %5 veya daha yakınsa (Yeni ATH / Ralli Kırılımı)
+        if row['dist_high'] >= -5.0:
+            mult *= 1.30
+        elif row['dist_high'] >= -10.0:
+            mult *= 1.15
 
         # Kapanış gücü filtresi
         if row['close_strength'] < 0.40:
-            mult *= 0.60
+            mult *= 0.70
         elif row['close_strength'] >= 0.75:
             mult *= 1.10
 
         # Günlük eksi kapatanlar
         if row['change_%'] < 0:
-            mult *= 0.30
+            mult *= 0.40
 
         trend_multiplier.append(mult)
 
@@ -172,7 +180,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
 
     # 4. Göstergeler (Telegram ve Streamlit)
     df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['macro_position'] * 100).round(1)
+    df['pct_skew'] = (df['trend_score_52w'] * 100).round(1)
 
     # 5. Squeeze ve Insider Verilerini Birleştir
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
@@ -187,7 +195,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
         df['insider_bonus'] = 0.0
 
     # 6. Final Quant Skoru
-    base_score = (rvol_score * 0.35) + (mom_score * 0.40) + (df['squeeze_skor'] * 0.25)
+    base_score = (rvol_score * 0.30) + (mom_score * 0.45) + (df['squeeze_skor'] * 0.25)
     final_score = (base_score * quality_factor) + df['insider_bonus']
     df['quant_score'] = np.clip(final_score, 0, 100).round(1)
 
