@@ -62,19 +62,17 @@ def gunluk_veri_cek(tickers):
                     acc_ratio = float(up_vol / down_vol) 
 
                     # 2. VOLATİLİTE DARALMASI / SIKIŞMA (VCP / Coiling): Son 10 günlük ATR / 30 günlük ATR oranı
-                    # 1.0'in altındaysa fiyat sıkışıyor, yay geriliyor demektir.
                     tr = np.maximum(h_series - l_series, np.abs(h_series - closes.shift(1)))
                     atr_10 = tr.tail(10).mean()
                     atr_30 = tr.tail(30).mean() + 1e-9
                     tightness = float(atr_10 / atr_30)
 
-                    # 3. ZİRVE KONSOLİDASYONU: Hisse tabanda değil, 3 aylık aralığın üst yarısında (güçlü bölgede) toplanıyor mu?
+                    # 3. ZİRVE KONSOLİDASYONU: Hisse tabanda değil, 3 aylık aralığın üst yarısında toplanıyor mu?
                     high_3mo = float(p_series.max())
                     low_3mo = float(p_series.min())
                     range_3mo = high_3mo - low_3mo
                     position = (close_today - low_3mo) / (range_3mo + 1e-9) if range_3mo > 0 else 0.5
 
-                    # Dipte ölü yatanları eliyoruz
                     if position < 0.35:
                         continue
 
@@ -99,9 +97,7 @@ def get_advanced_option_metrics(ticker):
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
     Öncü Toplanma Skorlama Motoru:
-    - Akümülasyon (Mal Toplama Oranı)
-    - Volatilite Daralması (Yay Sıkışması / Coiling)
-    - Zirve Konsolidasyonu ve Squeeze Potansiyeli
+    - Tüm Streamlit ve Telegram sütun gereksinimleri (rvol_ratio, option_oi vb.) tam uyumlu hale getirilmiştir.
     """
     if df.empty: 
         return df
@@ -110,6 +106,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     if 'tightness' not in df.columns: df['tightness'] = 1.0
     if 'position' not in df.columns: df['position'] = 0.5
 
+    # Streamlit ve Telegram botunun aradığı yedek sütun köprüleri (Hata önleyici)
     df['rvol_ratio'] = df['acc_ratio']
     df['option_oi'] = df['tightness']
 
@@ -126,7 +123,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
 
     # Normalizasyonlar
     acc_norm = np.clip((df['acc_ratio'] - 1.0) / 1.5 * 100, 10, 100)
-    tight_norm = np.clip((1.2 - df['tightness']) / 0.6 * 100, 10, 100) # Sıkışma ne kadar fazlaysa puan o kadar yüksek
+    tight_norm = np.clip((1.2 - df['tightness']) / 0.6 * 100, 10, 100)
     pos_norm = np.clip(df['position'] * 100, 10, 100)
     squeeze_norm = np.clip(df['squeeze_skor'], 0, 100)
 
@@ -142,11 +139,9 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
         bonus = row['insider_bonus']
         chg = row['change_%']
 
-        # Formül: %35 Mal Toplama (Acc) + %30 Volatilite Sıkışması (Tightness) + %15 Zirve Konumu + %20 Squeeze/Insider
+        # Formül: %35 Mal Toplama + %30 Volatilite Sıkışması + %15 Zirve Konumu + %20 Squeeze
         score = (a_score * 0.35) + (t_score * 0.30) + (p_score * 0.15) + (s_score * 0.20) + bonus
 
-        # Patlama öncesi toplama aşamasında olduğu için yatay veya hafif hareketler normaldir. 
-        # Ancak sert çöküş yaşayanlar (-3%'den fazla düşenler) hafifçe törpülenir.
         if chg < -3.0:
             score *= 0.70
 
@@ -158,7 +153,7 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     df['pct_oi_mom'] = np.array(pct_oi_list).round(1)
     df['pct_skew'] = np.array(pct_skew_list).round(1)
 
-    # Skor Farkı Hesabı
+    # Skor Farkı Hesabı (Gecmis veri çakışmasını önleyen güvenli yapı)
     df['score_diff'] = 0.0
     if df_gecmis is not None and not df_gecmis.empty and 'quant_score' in df_gecmis.columns:
         if 'tarih' in df_gecmis.columns:
