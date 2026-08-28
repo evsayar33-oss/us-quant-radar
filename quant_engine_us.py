@@ -4,23 +4,22 @@ import yfinance as yf
 import os
 
 GECMIS_DOSYA = "gecmis_veri.csv"
-MOM_PENCERE = 5 
 
 def gunluk_veri_cek(tickers):
     """
-    Tek günlük sahte hacim patlamalarını (Fakeout) elemek için;
-    Hacmin sadece bugün değil, son 3-5 gündür de kalıcı olarak yüksek olup olmadığını (Persistence) ölçer.
+    ÖNCÜ PATLAMA ÖNCESİ TOPLAMA AVCISI (Pre-Breakout Accumulation Hunter):
+    - Çevik fonların işlem yapabileceği esnek likiditede ($3M+) çalışır.
+    - Şok patlama GELMEDEN ÖNCE fonların mal toplama (Accumulation) ve sıkışma (Tightness/Coiling) izlerini sürer.
     """
     try:
         if not tickers:
             return pd.DataFrame()
 
-        # 6 aylık veriyi toplu indir
-        data = yf.download(tickers, period="6mo", interval="1d", progress=False, group_by='column')
+        # 3 aylık veri konsolidasyon ve toplanma evresini yakalamak için idealdir
+        data = yf.download(tickers, period="3mo", interval="1d", progress=False, group_by='column')
         if data.empty:
             return pd.DataFrame()
 
-        # Sütunları güvenle ayıkla
         if isinstance(data.columns, pd.MultiIndex):
             closes = data['Close'].ffill() if 'Close' in data.columns.levels[0] else pd.DataFrame()
             volumes = data['Volume'].ffill() if 'Volume' in data.columns.levels[0] else pd.DataFrame()
@@ -44,70 +43,51 @@ def gunluk_veri_cek(tickers):
                 h_series = highs[t].dropna() if t in highs.columns else p_series
                 l_series = lows[t].dropna() if t in lows.columns else p_series
                 
-                if len(p_series) >= 60 and len(v_series) >= 60:
+                if len(p_series) >= 30 and len(v_series) >= 30:
                     close_today = float(p_series.iloc[-1])
                     close_prev = float(p_series.iloc[-2])
                     change_pct = float((close_today / close_prev - 1) * 100)
                     vol_today = float(v_series.iloc[-1])
                     
-                    # Kuruşluk çöpleri ve sığ tahtaları ele ($5 altı ve $2M altı hacim)
+                    # Çevik fon eşiği: $3+ fiyat ve günlük $3M+ hacim
                     dollar_volume = close_today * vol_today
-                    if close_today < 5.0 or dollar_volume < 2_000_000:
+                    if close_today < 3.0 or dollar_volume < 3_000_000:
                         continue
 
-                    # 20 Günlük Ortalama Hacim Tabanı
-                    hist_vol = v_series.iloc[:-1].tail(20)
-                    vol_avg = float(hist_vol.mean())
-                    if vol_avg <= 0: continue
+                    # 1. AKILLI PARA BİRİKİMİ (Accumulation Ratio): Son 20 günde yeşil gün hacimleri / kırmızı gün hacimleri
+                    sub = pd.DataFrame({'close': p_series.tail(20), 'vol': v_series.tail(20)})
+                    sub['ret'] = sub['close'].pct_change()
+                    up_vol = sub[sub['ret'] > 0]['vol'].sum()
+                    down_vol = sub[sub['ret'] < 0]['vol'].sum() + 1e-9
+                    acc_ratio = float(up_vol / down_vol) 
 
-                    # 1. RVOL (Bugünkü Hacim Patlaması)
-                    rvol_today = vol_today / vol_avg
+                    # 2. VOLATİLİTE DARALMASI / SIKIŞMA (VCP / Coiling): Son 10 günlük ATR / 30 günlük ATR oranı
+                    # 1.0'in altındaysa fiyat sıkışıyor, yay geriliyor demektir.
+                    tr = np.maximum(h_series - l_series, np.abs(h_series - closes.shift(1)))
+                    atr_10 = tr.tail(10).mean()
+                    atr_30 = tr.tail(30).mean() + 1e-9
+                    tightness = float(atr_10 / atr_30)
 
-                    # 2. 3 GÜNLÜK HACİM KALICILIĞI (Multi-Day Volume Persistence): 
-                    # Hacim sadece bugün mü patladı, yoksa son 3 gündür de yüksek mi?
-                    vol_3d_avg = float(v_series.iloc[-3:].mean())
-                    rvol_3d = vol_3d_avg / vol_avg
+                    # 3. ZİRVE KONSOLİDASYONU: Hisse tabanda değil, 3 aylık aralığın üst yarısında (güçlü bölgede) toplanıyor mu?
+                    high_3mo = float(p_series.max())
+                    low_3mo = float(p_series.min())
+                    range_3mo = high_3mo - low_3mo
+                    position = (close_today - low_3mo) / (range_3mo + 1e-9) if range_3mo > 0 else 0.5
 
-                    # Trend Kapısı (3 aylık getiri ve 6 aylık makro konum)
-                    mom_3mo = float((close_today / p_series.iloc[-63] - 1) * 100) if len(p_series) >= 63 else 0.0
-                    high_6mo = float(p_series.max())
-                    low_6mo = float(p_series.min())
-                    range_6mo = high_6mo - low_6mo
-                    macro_position = (close_today - low_6mo) / (range_6mo + 1e-9) if range_6mo > 0 else 0.5
-
-                    # Kötü trendlileri kapıdan at
-                    if mom_3mo < -2.0 or macro_position < 0.45:
+                    # Dipte ölü yatanları eliyoruz
+                    if position < 0.35:
                         continue
-
-                    # Sıkı Hacim Filtresi: Tek günlük sahte patlamaları (RVOL < 1.10 veya 3 günlük ortalaması düşük olanları) ele
-                    if rvol_today < 1.10 or rvol_3d < 1.05:
-                        continue
-
-                    # Kapanış Gücü
-                    high_today = float(h_series.iloc[-1])
-                    low_today = float(l_series.iloc[-1])
-                    candle_range = high_today - low_today
-                    close_strength = (close_today - low_today) / (candle_range + 1e-9) if candle_range > 0 else 0.7
-
-                    # İstikrarlı Çoklu Zaman İvmeleri (1G, 3G, 5G, 1A)
-                    mom_3d = float((close_today / p_series.iloc[-3] - 1) * 100) if len(p_series) >= 3 else change_pct
-                    mom_5d = float((close_today / p_series.iloc[-5] - 1) * 100) if len(p_series) >= 5 else change_pct
-                    mom_1mo = float((close_today / p_series.iloc[-20] - 1) * 100) if len(p_series) >= 20 else change_pct
 
                     df_bugun.append({
                         "ticker": t,
                         "close": round(close_today, 2),
                         "volume": vol_today,
                         "change_%": round(change_pct, 2),
-                        "rvol": round(rvol_today, 2),
-                        "rvol_3d": round(rvol_3d, 2),
-                        "mom_3d": round(mom_3d, 2),
-                        "mom_5d": round(mom_5d, 2),
-                        "mom_1mo": round(mom_1mo, 2),
-                        "close_strength": round(close_strength, 2),
-                        "macro_position": round(macro_position, 2)
+                        "acc_ratio": round(acc_ratio, 2),
+                        "tightness": round(tightness, 2),
+                        "position": round(position, 2)
                     })
-                    
+                                
         return pd.DataFrame(df_bugun)
     except Exception as e:
         print(f"Veri cekme hatasi: {e}")
@@ -118,71 +98,21 @@ def get_advanced_option_metrics(ticker):
 
 def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metrics_map):
     """
-    Hacmin sürekliliğine (Persistence) ve istikrarlı basamak ivmesine göre puanlar.
-    Tek günlük hacim tuzaklarını en alta atar.
+    Öncü Toplanma Skorlama Motoru:
+    - Akümülasyon (Mal Toplama Oranı)
+    - Volatilite Daralması (Yay Sıkışması / Coiling)
+    - Zirve Konsolidasyonu ve Squeeze Potansiyeli
     """
     if df.empty: 
         return df
 
-    if 'rvol' not in df.columns: df['rvol'] = 1.0
-    if 'rvol_3d' not in df.columns: df['rvol_3d'] = 1.0
-    if 'close_strength' not in df.columns: df['close_strength'] = 0.7
-    if 'mom_3d' not in df.columns: df['mom_3d'] = df['change_%']
-    if 'mom_5d' not in df.columns: df['mom_5d'] = df['change_%']
-    if 'mom_1mo' not in df.columns: df['mom_1mo'] = 0.0
-    if 'macro_position' not in df.columns: df['macro_position'] = 0.5
+    if 'acc_ratio' not in df.columns: df['acc_ratio'] = 1.0
+    if 'tightness' not in df.columns: df['tightness'] = 1.0
+    if 'position' not in df.columns: df['position'] = 0.5
 
-    df['rvol_ratio'] = df['rvol']
-    df['option_oi'] = df['rvol']
+    df['rvol_ratio'] = df['acc_ratio']
+    df['option_oi'] = df['tightness']
 
-    # 1. Hacim Kalıcılık Skoru (Bugünkü RVOL + Son 3 Günlük RVOL Ortalaması)
-    persistence_score = np.clip(((df['rvol'] - 1.0) / 3.0 * 50) + ((df['rvol_3d'] - 1.0) / 2.0 * 50), 10, 100)
-
-    # 2. İstikrarlı Basamak İvme Skoru (1G, 3G, 5G, 1A pozitif uyum)
-    mom_score = np.clip(
-        40 + 
-        (df['change_%'] * 2.0) + 
-        (df['mom_3d'] * 1.5) + 
-        (df['mom_5d'] * 1.0) + 
-        (df['mom_1mo'] * 0.5), 
-        0, 100
-    )
-
-    # 3. DEVAMLILIK ÇARPANI (Continuation Multiplier)
-    continuation_mult = []
-    for _, row in df.iterrows():
-        mult = 1.0
-        
-        # Eğer hacim hem bugün hem de son 3 gündür ortalamanın çok üzerindeyse (Gerçek Akümülasyon)
-        if row['rvol'] >= 2.0 and row['rvol_3d'] >= 1.5:
-            mult *= 1.35
-        # Eğer sadece bugün patlayıp dün hacimsizse (Tek günlük şüphe / Fakeout)
-        elif row['rvol'] >= 2.0 and row['rvol_3d'] < 1.2:
-            mult *= 0.75 # Cezalandırılır
-
-        # Trend ne kadar güçlüyse
-        if row['macro_position'] >= 0.75:
-            mult *= 1.20
-
-        # Kapanış gücü
-        if row['close_strength'] >= 0.80:
-            mult *= 1.15
-        elif row['close_strength'] < 0.40:
-            mult *= 0.50
-
-        # Günlük eksi kapatanlar
-        if row['change_%'] < 0:
-            mult *= 0.10
-
-        continuation_mult.append(mult)
-
-    quality_factor = np.array(continuation_mult)
-
-    # 4. Göstergeler (Telegram ve Streamlit)
-    df['pct_oi_mom'] = mom_score.round(1)
-    df['pct_skew'] = (df['rvol_3d'] * 50).round(1) # Skew alanında '3 Günlük Ortalama Hacim Çarpanı' yazar
-
-    # 5. Squeeze ve Insider Verileri
     if df_yapisal is not None and not df_yapisal.empty and 'squeeze_skor' in df_yapisal.columns:
         df = df.merge(df_yapisal[['ticker', 'squeeze_skor']], on='ticker', how='left')
         df['squeeze_skor'] = df['squeeze_skor'].fillna(50.0)
@@ -194,12 +124,41 @@ def calculate_us_scores(df, df_gecmis, df_yapisal, insider_bonus_map, opt_metric
     else:
         df['insider_bonus'] = 0.0
 
-    # 6. Final Quant Skoru
-    base_score = (persistence_score * 0.40) + (mom_score * 0.35) + (df['squeeze_skor'] * 0.25)
-    final_score = (base_score * quality_factor) + df['insider_bonus']
-    df['quant_score'] = np.clip(final_score, 0, 100).round(1)
+    # Normalizasyonlar
+    acc_norm = np.clip((df['acc_ratio'] - 1.0) / 1.5 * 100, 10, 100)
+    tight_norm = np.clip((1.2 - df['tightness']) / 0.6 * 100, 10, 100) # Sıkışma ne kadar fazlaysa puan o kadar yüksek
+    pos_norm = np.clip(df['position'] * 100, 10, 100)
+    squeeze_norm = np.clip(df['squeeze_skor'], 0, 100)
 
-    # 7. Skor Farkı Hesabı
+    quant_scores = []
+    pct_oi_list = []
+    pct_skew_list = []
+
+    for i, row in df.iterrows():
+        a_score = acc_norm.iloc[i]
+        t_score = tight_norm.iloc[i]
+        p_score = pos_norm.iloc[i]
+        s_score = squeeze_norm.iloc[i]
+        bonus = row['insider_bonus']
+        chg = row['change_%']
+
+        # Formül: %35 Mal Toplama (Acc) + %30 Volatilite Sıkışması (Tightness) + %15 Zirve Konumu + %20 Squeeze/Insider
+        score = (a_score * 0.35) + (t_score * 0.30) + (p_score * 0.15) + (s_score * 0.20) + bonus
+
+        # Patlama öncesi toplama aşamasında olduğu için yatay veya hafif hareketler normaldir. 
+        # Ancak sert çöküş yaşayanlar (-3%'den fazla düşenler) hafifçe törpülenir.
+        if chg < -3.0:
+            score *= 0.70
+
+        quant_scores.append(np.clip(score, 0, 100))
+        pct_oi_list.append(a_score)
+        pct_skew_list.append(t_score)
+
+    df['quant_score'] = np.array(quant_scores).round(1)
+    df['pct_oi_mom'] = np.array(pct_oi_list).round(1)
+    df['pct_skew'] = np.array(pct_skew_list).round(1)
+
+    # Skor Farkı Hesabı
     df['score_diff'] = 0.0
     if df_gecmis is not None and not df_gecmis.empty and 'quant_score' in df_gecmis.columns:
         if 'tarih' in df_gecmis.columns:
